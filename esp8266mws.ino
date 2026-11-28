@@ -1,18 +1,18 @@
 /*
-    Esp8266MWS -> Smart Solar APRS Node (Weather API + Sunset Sleep + Telemetry + Web UI)
-    Original Author : bg4uvr @ 2021.5 (based on ver 0.17a)
-    Modified by     : bg4vrg @ 2026.11.25
+    Esp8266MWS -> Solar Low-Power APRS Station (v2.1)
+    Original Author : BG4UVR @ 2021.5 (based on ver 0.17a)
+    Modified by     : BG4VRG @ 2026.11.28
     Features        :
-      1. Astronomical Sunrise/Sunset calculation -> 1h deep sleep at night ([Night])
-      2. Daytime Open-Meteo Weather check -> 1h deep sleep on overcast/rainy days ([Cloudy])
-      3. Voltage protection (<3.15V -> 1h [LowPower], <3.00V -> RF-off cutoff sleep)
-      4. Built-in Web Configuration UI (http://<IP>) + TCP Debug CLI
-      5. APRS Standard Telemetry (T# + PARM/UNIT/EQNS) for aprs.fi charts
+      1. 3-Mode Sensor Switch (-t 0: Off | 1: Comment text [Default, S-] | 2: Standard APRS WX [R_])
+      2. AHT20 primary temperature (with BMP280 fallback & range sanity checks)
+      3. 3-Tier Adaptive Solar Sleep (Night [Night] | Rainy/Cloudy [Cloudy] | LowVolt [LowPower] / Cutoff)
+      4. Built-in Web Configuration UI (http://<IP>) + TCP Debug CLI + Hold FLASH button at boot
+      5. APRS Standard Telemetry (T# + PARM/UNIT/EQNS) with RTC sequence memory
 */
 // #define DEBUG_MODE
 // #define EEPROM_CLEAR
 
-const char fw[20] = {"20261125-smart"};
+const char fw[20] = {"v2.1"};
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -74,7 +74,7 @@ typedef struct
     language_t language;
     char symbol[4];
     char comment[40];
-    uint8_t wx_mode; // 0: 关闭气象(默认), 1: 开启气象
+    uint8_t wx_mode; // 0: 纯固定站(关传感器), 1: 固定站+注释带温湿度气压(默认), 2: 标准APRS气象站
 } cfg_t;
 
 // RTC 断电记忆结构体
@@ -130,9 +130,9 @@ uint32_t mycrc32(uint8_t *data, int length)
 uint16_t get_next_telemetry_seq()
 {
     ESP.rtcUserMemoryRead(0, (uint32_t *)&rtcData, sizeof(rtcData));
-    if (rtcData.magic != 0x20261125)
+    if (rtcData.magic != 0x20261128)
     {
-        rtcData.magic = 0x20261125;
+        rtcData.magic = 0x20261128;
         rtcData.seq = 1;
     }
     else
@@ -146,7 +146,6 @@ uint16_t get_next_telemetry_seq()
 }
 
 // ======================== 坐标转换与日出日落天文计算 ========================
-// 将 APRS 的 ddmm.mm / dddmm.mm 格式转换为十进制度数
 float aprsToDecimal(float aprsCoord)
 {
     int deg = (int)(aprsCoord / 100.0f);
@@ -154,20 +153,16 @@ float aprsToDecimal(float aprsCoord)
     return (float)deg + (min / 60.0f);
 }
 
-// 基于 NOAA 太阳位置算法判断当前 UTC 时间是否处于日落后的夜间
 bool check_is_night(struct tm *timenow)
 {
     if (timenow->tm_year + 1900 < 2024)
-        return false; // NTP 未同步成功时默认按白天处理
+        return false;
 
     float lat_deg = aprsToDecimal(mycfg.lat);
     float lon_deg = aprsToDecimal(mycfg.lon);
     int doy = timenow->tm_yday + 1;
 
-    // 分数年 (弧度)
     double gamma = 2.0 * PI / 365.0 * (doy - 1);
-
-    // 均时差 (分钟) 与 太阳赤纬角 (弧度)
     double eqtime = 229.18 * (0.000075 + 0.001868 * cos(gamma) - 0.032077 * sin(gamma)
                               - 0.014615 * cos(2.0 * gamma) - 0.040849 * sin(2.0 * gamma));
     double decl = 0.006918 - 0.399912 * cos(gamma) + 0.070257 * sin(gamma)
@@ -178,13 +173,12 @@ bool check_is_night(struct tm *timenow)
     double cos_ha = (cos(90.833 * DEG_TO_RAD) / (cos(lat_rad) * cos(decl))) - tan(lat_rad) * tan(decl);
 
     if (cos_ha > 1.0)
-        return true;  // 极夜
+        return true;
     if (cos_ha < -1.0)
-        return false; // 极昼
+        return false;
 
     double ha_deg = acos(cos_ha) * RAD_TO_DEG;
 
-    // 计算当天的 UTC 日出与日落分钟数 (0 ~ 1440)
     int sunrise_utc = (int)round(720.0 - 4.0 * (lon_deg + ha_deg) - eqtime);
     int sunset_utc  = (int)round(720.0 - 4.0 * (lon_deg - ha_deg) - eqtime);
 
@@ -193,15 +187,10 @@ bool check_is_night(struct tm *timenow)
 
     int now_utc_min = timenow->tm_hour * 60 + timenow->tm_min;
 
-    // 东半球在 UTC 时间下通常会出现 sunrise_utc > sunset_utc (跨 UTC 零点)
     if (sunrise_utc < sunset_utc)
-    {
         return (now_utc_min < sunrise_utc || now_utc_min > sunset_utc);
-    }
     else
-    {
         return (now_utc_min > sunset_utc && now_utc_min < sunrise_utc);
-    }
 }
 
 // ======================== 白天请求 Open-Meteo 判断阴雨天 ========================
@@ -217,7 +206,7 @@ bool check_cloudy_weather()
 
     WiFiClient httpClient;
     HTTPClient http;
-    http.setTimeout(3000); // 最多等待3秒，避免接口卡顿耗电
+    http.setTimeout(3000);
 
     if (http.begin(httpClient, url))
     {
@@ -225,20 +214,18 @@ bool check_cloudy_weather()
         if (httpCode == HTTP_CODE_OK)
         {
             String payload = http.getString();
-            // 定位到 "current":{... "weather_code":X} 中的最后一个 weather_code
             int idx = payload.lastIndexOf("\"weather_code\":");
             if (idx != -1)
             {
                 current_wmo_code = payload.substring(idx + 15).toInt();
                 http.end();
-                // WMO 天气代码: 0晴, 1少云, 2局部多云; >=3 为阴天(3)、雾(45/48)、雨雪(51+)
                 return (current_wmo_code >= 3);
             }
         }
         http.end();
     }
     current_wmo_code = -1;
-    return false; // 网络请求失败时默认按晴天正常发送
+    return false;
 }
 
 // ======================== 自动配网 ========================
@@ -255,11 +242,14 @@ void WiFisetup()
     }
 }
 
-// ======================== 传感器初始化与读取 ========================
+// ======================== 传感器初始化与读取（含异常值过滤） ========================
 void init_sensors()
 {
     Wire.begin(12, 14);
+    Wire.setClock(50000);
     bm280_state = bmp.begin();
+    if (!bm280_state)
+        bm280_state = bmp.begin(BMP280_ADDRESS_ALT);
     aht20_state = aht.begin();
 }
 
@@ -272,8 +262,12 @@ bool read_bmp280(float *temperature, float *pressure)
                     Adafruit_BMP280::SAMPLING_X4,
                     Adafruit_BMP280::FILTER_X16,
                     Adafruit_BMP280::STANDBY_MS_1);
-    *temperature = bmp.readTemperature();
-    *pressure = bmp.readPressure();
+    float t = bmp.readTemperature();
+    float p = bmp.readPressure();
+    if (isnan(t) || isnan(p) || t < -40.0f || t > 85.0f || p < 30000.0f || p > 110000.0f)
+        return false;
+    *temperature = t;
+    *pressure = p;
     return true;
 }
 
@@ -283,8 +277,12 @@ bool read_aht20(float *temperature, float *humidity)
         return false;
     sensors_event_t humAHT, tempAHT;
     aht.getEvent(&humAHT, &tempAHT);
-    *temperature = tempAHT.temperature;
-    *humidity = humAHT.relative_humidity;
+    float t = tempAHT.temperature;
+    float h = humAHT.relative_humidity;
+    if (isnan(t) || isnan(h) || t < -40.0f || t > 85.0f || h < 0.0f || h > 100.0f)
+        return false;
+    *temperature = t;
+    *humidity = h;
     return true;
 }
 
@@ -312,8 +310,8 @@ void eeprom_save()
 
 void cfg_init()
 {
-    mycfg.lon = 11816.00f;
-    mycfg.lat = 3357.00f;
+    mycfg.lon = 11818.88f;
+    mycfg.lat = 3357.77f;
     mycfg.send_interval = 900;
     mycfg.password = 0;
     mycfg.aprs_server_port = 14580;
@@ -324,9 +322,9 @@ void cfg_init()
     strcpy(mycfg.ssid, "13");
     mycfg.sysstate = SYS_CFG;
     mycfg.language = CN;
-    mycfg.wx_mode = 0;
+    mycfg.wx_mode = 1; // 默认模式1: 固定站 + 注释附带温湿度气压
     strcpy(mycfg.symbol, "S-");
-    strcpy(mycfg.comment, "Solar Power Station");
+    strcpy(mycfg.comment, "ESP Solar Sta.");
     eeprom_save();
 }
 
@@ -337,15 +335,35 @@ void handleWebRoot()
     int32_t rssi = WiFi.RSSI();
     String pwrState = (voltage < LOW_POWER_VOLT) ? "低电压保护 (1小时/次)" : "智能光控+气象调度 (晴天" + String(mycfg.send_interval / 60) + "分钟 / 夜间及阴雨1小时)";
 
+    String sensorInfo = "未启用传感器 (模式 0)";
+    if (mycfg.wx_mode > 0)
+    {
+        if (!aht20_state && !bm280_state)
+            init_sensors();
+        float tAht = 0, hAht = 0, tBmp = 0, pBmp = 0;
+        bool okAht = read_aht20(&tAht, &hAht);
+        bool okBmp = read_bmp280(&tBmp, &pBmp);
+        sensorInfo = "";
+        if (okAht)
+            sensorInfo += "AHT20: <b>" + String(tAht, 1) + "°C / " + String((int)round(hAht)) + "%</b> &nbsp;|&nbsp; ";
+        else
+            sensorInfo += "AHT20: <span style='color:#d93025'>未连接</span> &nbsp;|&nbsp; ";
+
+        if (okBmp)
+            sensorInfo += "BMP280: <b>" + String(pBmp / 100.0f, 1) + "hPa</b> (参考温" + String(tBmp, 1) + "°C)";
+        else
+            sensorInfo += "BMP280: <span style='color:#d93025'>未连接</span>";
+    }
+
     String html = F("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'>"
                     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                    "<title>ESP8266 APRS 节点配置</title>"
+                    "<title>太阳能低功耗 APRS 固定台配置</title>"
                     "<style>"
                     "body{font-family:system-ui,-apple-system,sans-serif;background:#f2f4f8;margin:0;padding:16px;color:#222;}"
                     ".card{max-width:480px;margin:0 auto;background:#fff;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.08);}"
                     "h2{margin:0 0 6px;font-size:1.3rem;color:#1a73e8;}"
                     ".sub{font-size:0.85rem;color:#666;margin-bottom:16px;}"
-                    ".status{background:#eef5ff;padding:10px 12px;border-radius:8px;font-size:0.9rem;margin-bottom:16px;line-height:1.6;}"
+                    ".status{background:#eef5ff;padding:10px 12px;border-radius:8px;font-size:0.88rem;margin-bottom:16px;line-height:1.65;}"
                     "label{display:block;font-size:0.88rem;font-weight:600;margin:10px 0 4px;}"
                     "input,select{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:0.95rem;}"
                     ".row{display:flex;gap:10px;}.row>div{flex:1;}"
@@ -354,11 +372,12 @@ void handleWebRoot()
                     ".btn-def{background:#d93025;margin-top:10px;}"
                     ".btn-def:hover{background:#a50e0e;}"
                     "</style></head><body><div class='card'>"
-                    "<h2>ESP8266 APRS 太阳能节点</h2>"
+                    "<h2>太阳能低功耗 APRS 固定台</h2>"
                     "<div class='sub'>Ver: ");
     html += fw;
     html += F(" | Mod: BG4VRG | Orig: BG4UVR</div><div class='status'>");
     html += "当前电压: <b>" + String(voltage, 2) + " V</b> &nbsp;|&nbsp; Wi-Fi 信号: <b>" + String(rssi) + " dBm</b><br>";
+    html += "传感器状态: " + sensorInfo + "<br>";
     html += "休眠策略: <b>" + pwrState + "</b><br>";
     html += "运行状态: <b>" + String(mycfg.sysstate == SYS_RUN ? "正常运行中" : "等待配置") + "</b> &nbsp;|&nbsp; IP: " + WiFi.localIP().toString();
     html += F("</div><form action='/save' method='POST'>"
@@ -375,14 +394,17 @@ void handleWebRoot()
     html += String(mycfg.lon, 2);
     html += F("'></div></div><div class='row'><div><label>台站图标 (2位字符)</label><input name='sym' maxlength='2' value='");
     html += String(mycfg.symbol);
-    html += F("'></div><div><label>气象站功能开关</label><select name='wx'>"
+    html += F("'></div><div><label>传感器工作模式</label><select name='wx'>"
               "<option value='0'");
     if (mycfg.wx_mode == 0)
         html += F(" selected");
-    html += F(">0 - 关闭 (太阳能固定站)</option><option value='1'");
+    html += F(">0 - 关闭 (仅电压)</option><option value='1'");
     if (mycfg.wx_mode == 1)
         html += F(" selected");
-    html += F(">1 - 开启 (上报温湿度气压)</option></select></div></div>"
+    html += F(">1 - 注释附带温湿度气压 (默认)</option><option value='2'");
+    if (mycfg.wx_mode == 2)
+        html += F(" selected");
+    html += F(">2 - 标准APRS气象站 (R_)</option></select></div></div>"
               "<label>注释文字 (Comment)</label><input name='cmt' maxlength='38' value='");
     html += String(mycfg.comment);
     html += F("'><div class='row'><div><label>白天晴天间隔 (600-1200秒)</label><input type='number' min='600' max='1200' name='intv' value='");
@@ -429,13 +451,14 @@ void handleWebSave()
     mycfg.lat = webServer.arg("lat").toFloat();
     mycfg.lon = webServer.arg("lon").toFloat();
 
-    uint8_t new_wx = webServer.arg("wx").toInt() == 1 ? 1 : 0;
+    int wx_in = webServer.arg("wx").toInt();
+    uint8_t new_wx = (wx_in >= 0 && wx_in <= 2) ? (uint8_t)wx_in : 1;
     String sym = webServer.arg("sym");
     sym.trim();
 
     if (new_wx != mycfg.wx_mode && sym == String(mycfg.symbol))
     {
-        strcpy(mycfg.symbol, new_wx == 1 ? "R_" : "S-");
+        strcpy(mycfg.symbol, new_wx == 2 ? "R_" : "S-");
     }
     else if (is_valid_symbol(sym.c_str()))
     {
@@ -536,14 +559,13 @@ void send_data()
         DBGPRINTLN("Nighttime check -> After sunset -> 1h sleep");
     }
 
-    // 综合决定下次休眠周期 (低电压 / 夜间 / 白天阴雨 均切换为 3600 秒 = 1 小时)
     bool need_long_sleep = (low_power_mode || night_mode || cloudy_mode);
     sleepsec = need_long_sleep ? 3600 : mycfg.send_interval;
 
     // 3. 首次开机 (seq == 1) 或每隔 3 小时发送状态报文与遥测定义（PARM / UNIT / EQNS）
     if (seq == 1 || ((timenow->tm_hour % 3 == 0) && (timenow->tm_min < (sleepsec / 60) + 1)))
     {
-        snprintf(msgbuf, sizeof(msgbuf), "%s-%s>APUVR:>ESP8266 Solar Power Station ver:%s by BG4VRG (orig: BG4UVR)",
+        snprintf(msgbuf, sizeof(msgbuf), "%s-%s>APUVR:>太阳能低功耗APRS固定台 %s by BG4VRG (Orig: BG4UVR)",
                  mycfg.callsign, mycfg.ssid, fw);
 #ifndef DEBUG_MODE
         client_aprs.println(msgbuf);
@@ -554,7 +576,7 @@ void send_data()
         char call_ssid[12];
         snprintf(call_ssid, sizeof(call_ssid), "%s-%s", mycfg.callsign, mycfg.ssid);
 
-        snprintf(msgbuf, sizeof(msgbuf), "%s>APUVR::%-9s:PARM.BatVolt,WiFiRSSI,WakeCnt,Spare1,Spare2,WX_Mode,LowPwr,Night,Cloudy",
+        snprintf(msgbuf, sizeof(msgbuf), "%s>APUVR::%-9s:PARM.BatVolt,WiFiRSSI,WakeCnt,Spare1,Spare2,WX_Std,LowPwr,Night,Cloudy",
                  call_ssid, call_ssid);
 #ifndef DEBUG_MODE
         client_aprs.println(msgbuf);
@@ -579,7 +601,37 @@ void send_data()
         delay(200);
     }
 
-    // 4. 拼接状态标签 ([LowPower] / [Night] / [Cloudy])
+    // 4. 读取本地传感器（仅在模式 1 或模式 2 下读取，以 AHT20 温度为准，BMP280 仅作故障兜底）
+    float tempAHT = 0, humAHT = 0, tempBMP = 0, pressBMP = 0;
+    bool aht_ok = false, bmp_ok = false, has_temp = false;
+    float final_temp = 0.0f;
+
+    if (mycfg.wx_mode == 1 || mycfg.wx_mode == 2)
+    {
+        aht_ok = read_aht20(&tempAHT, &humAHT);
+        bmp_ok = read_bmp280(&tempBMP, &pressBMP);
+
+        if (client_dbg.connected())
+        {
+            if (aht_ok)
+                client_dbg.printf("AHT20 -> Temp: %.2f C, Hum: %.1f %%\n", tempAHT, humAHT);
+            if (bmp_ok)
+                client_dbg.printf("BMP280 -> Press: %.2f hPa (Ref Temp: %.2f C)\n", pressBMP / 100.0f, tempBMP);
+        }
+
+        if (aht_ok)
+        {
+            final_temp = tempAHT;
+            has_temp = true;
+        }
+        else if (bmp_ok)
+        {
+            final_temp = tempBMP;
+            has_temp = true;
+        }
+    }
+
+    // 5. 拼接状态标签 ([LowPower] / [Night] / [Cloudy])
     char status_tag[32] = {0};
     if (low_power_mode)
         strcat(status_tag, " [LowPower]");
@@ -588,31 +640,20 @@ void send_data()
     else if (cloudy_mode)
         strcat(status_tag, " [Cloudy]");
 
-    // 5. 发送位置报文
-    if (mycfg.wx_mode == 1)
+    // 6. 按当前模式组装并发送位置报文
+    if (mycfg.wx_mode == 2)
     {
-        float temperatureAHT, humidity, temperatureBMP, pressure;
+        // 模式 2: 标准 APRS 气象报文格式
         char temperatureS[4] = {"..."};
         char humidityS[3] = {".."};
         char pressureS[6] = {"....."};
 
-        bool bmpRES = read_bmp280(&temperatureBMP, &pressure);
-        bool ahtRES = read_aht20(&temperatureAHT, &humidity);
-
-        if (bmpRES)
-        {
-            snprintf(temperatureS, sizeof(temperatureS), "%03d", (int8_t)(temperatureBMP * 9 / 5 + 32));
-            snprintf(pressureS, sizeof(pressureS), "%05d", (uint16_t)(pressure / 10));
-        }
-        if (ahtRES)
-        {
-            snprintf(temperatureS, sizeof(temperatureS), "%03d", (int8_t)(temperatureAHT * 9 / 5 + 32));
-            snprintf(humidityS, sizeof(humidityS), "%02d", (uint8_t)humidity);
-        }
-        if (ahtRES && bmpRES)
-        {
-            snprintf(temperatureS, sizeof(temperatureS), "%03d", (int8_t)(((temperatureAHT + temperatureBMP) / 2) * 9 / 5 + 32));
-        }
+        if (has_temp)
+            snprintf(temperatureS, sizeof(temperatureS), "%03d", (int8_t)round(final_temp * 9.0f / 5.0f + 32.0f));
+        if (aht_ok)
+            snprintf(humidityS, sizeof(humidityS), "%02d", (uint8_t)round(humAHT));
+        if (bmp_ok)
+            snprintf(pressureS, sizeof(pressureS), "%05d", (uint16_t)round(pressBMP / 10.0f));
 
         snprintf(msgbuf, sizeof(msgbuf),
                  "%s-%s>APUVR:!%07.2f%c%c%08.2f%c%c.../...g...t%sr...p...h%sb%s%s%sBat:%0.2fV%s",
@@ -622,8 +663,37 @@ void send_data()
                  temperatureS, humidityS, pressureS,
                  mycfg.comment, strlen(mycfg.comment) > 0 ? " " : "", voltage, status_tag);
     }
+    else if (mycfg.wx_mode == 1)
+    {
+        // 模式 1 (默认): 固定站图标 + 注释后附带温湿度气压文本
+        char env_str[40] = {0};
+        char tmp[16];
+        if (has_temp)
+        {
+            snprintf(tmp, sizeof(tmp), " %.1fC", final_temp);
+            strcat(env_str, tmp);
+        }
+        if (aht_ok)
+        {
+            snprintf(tmp, sizeof(tmp), " %d%%", (int)round(humAHT));
+            strcat(env_str, tmp);
+        }
+        if (bmp_ok)
+        {
+            snprintf(tmp, sizeof(tmp), " %dhPa", (int)round(pressBMP / 100.0f));
+            strcat(env_str, tmp);
+        }
+
+        snprintf(msgbuf, sizeof(msgbuf),
+                 "%s-%s>APUVR:!%07.2f%c%c%08.2f%c%c%s%sBat:%0.2fV%s%s",
+                 mycfg.callsign, mycfg.ssid,
+                 mycfg.lat, mycfg.lat > 0 ? 'N' : 'S', mycfg.symbol[0],
+                 mycfg.lon, mycfg.lon > 0 ? 'E' : 'W', mycfg.symbol[1],
+                 mycfg.comment, strlen(mycfg.comment) > 0 ? " " : "", voltage, env_str, status_tag);
+    }
     else
     {
+        // 模式 0: 纯固定站（不读取传感器，仅上报电压）
         snprintf(msgbuf, sizeof(msgbuf),
                  "%s-%s>APUVR:!%07.2f%c%c%08.2f%c%c%s%sBat:%0.2fV%s",
                  mycfg.callsign, mycfg.ssid,
@@ -638,7 +708,7 @@ void send_data()
     DBGPRINTLN(msgbuf);
     delay(200);
 
-    // 6. 发送标准 APRS 遥测数据帧 (T#)
+    // 7. 发送标准 APRS 遥测数据帧 (T#)，Spare1 与 Spare2 保持 000
     uint16_t v_val = (uint16_t)(voltage * 100.0f);
     uint16_t rssi_val = (rssi < 0) ? (uint16_t)(-rssi) : 0;
     if (rssi_val > 999)
@@ -648,7 +718,7 @@ void send_data()
              "%s-%s>APUVR:T#%03d,%03d,%03d,%03d,000,000,%d%d%d%d0000",
              mycfg.callsign, mycfg.ssid,
              seq, v_val, rssi_val, seq,
-             mycfg.wx_mode == 1 ? 1 : 0,
+             mycfg.wx_mode == 2 ? 1 : 0,
              low_power_mode ? 1 : 0,
              night_mode ? 1 : 0,
              cloudy_mode ? 1 : 0);
@@ -721,11 +791,12 @@ bool loginAPRS()
 // ======================== TCP 调试主机配置逻辑 ========================
 void dispset()
 {
+    const char *mode_desc[] = {"0 (关闭传感器)", "1 (注释附带温湿度气压)", "2 (标准APRS气象站)"};
     client_dbg.println(mycfg.language == CN ? "系统当前配置：" : "System current configuration:");
     client_dbg.printf("APRS服务器:\t%s:%d\n", mycfg.aprs_server_addr, mycfg.aprs_server_port);
     client_dbg.printf("调试主机:\t%s:%d\n", mycfg.debug_server_addr, mycfg.debug_server_port);
     client_dbg.printf("呼号-SSID:\t%s-%s (Pass: %d)\n", mycfg.callsign, mycfg.ssid, mycfg.password);
-    client_dbg.printf("气象开关:\t%d (%s)\n", mycfg.wx_mode, mycfg.wx_mode == 1 ? "开启" : "关闭");
+    client_dbg.printf("传感器模式:\t%s\n", mode_desc[mycfg.wx_mode <= 2 ? mycfg.wx_mode : 1]);
     client_dbg.printf("台站图标:\t%s\n", mycfg.symbol);
     client_dbg.printf("注释文字:\t%s\n", mycfg.comment);
     client_dbg.printf("晴天发送间隔:\t%d 秒 (夜间/阴雨/低电自动切为3600秒)\n", mycfg.send_interval);
@@ -734,11 +805,11 @@ void dispset()
 
 void dispsysinfo()
 {
-    client_dbg.printf("\nEsp8266 太阳能APRS固定站 (Ver:%s | Mod:BG4VRG | Orig:BG4UVR)\n", fw);
+    client_dbg.printf("\n太阳能低功耗APRS固定台 (Ver:%s | Mod:BG4VRG | Orig:BG4UVR)\n", fw);
     client_dbg.print("网页配置后台地址: http://");
     client_dbg.println(WiFi.localIP());
     dispset();
-    client_dbg.println("\n支持命令行: cfg -c 呼号 -w 验证码 -a 纬度 -o 经度 -t 0/1 -i 图标 -m \"注释\" | rst | def\n");
+    client_dbg.println("\n支持命令行: cfg -c 呼号 -w 验证码 -a 纬度 -o 经度 -t 0/1/2 -i 图标 -m \"注释\" | rst | def\n");
 }
 
 uint8_t split_args(char *str, char **argv, uint8_t max_args)
@@ -876,7 +947,7 @@ void set_cfg()
                 fail = true;
             break;
         case 't':
-            if (strcmp(optarg, "0") == 0 || strcmp(optarg, "1") == 0)
+            if (strcmp(optarg, "0") == 0 || strcmp(optarg, "1") == 0 || strcmp(optarg, "2") == 0)
             {
                 wx_opt = atoi(optarg);
                 ok = true;
@@ -963,16 +1034,11 @@ void set_cfg()
     if (wx_opt != -1)
     {
         mycfg.wx_mode = (uint8_t)wx_opt;
-        if (mycfg.wx_mode == 1)
-        {
+        if (mycfg.wx_mode > 0)
             init_sensors();
-            if (!symbol_explicit)
-                strcpy(mycfg.symbol, "R_");
-        }
-        else if (!symbol_explicit)
-        {
-            strcpy(mycfg.symbol, "S-");
-        }
+
+        if (!symbol_explicit)
+            strcpy(mycfg.symbol, mycfg.wx_mode == 2 ? "R_" : "S-");
     }
 
     if (strcmp(mycfg.callsign, "NOCALL") == 0 || strlen(mycfg.callsign) < 4 || mycfg.password == 0)
@@ -1037,7 +1103,7 @@ void setup()
         mycfg.sysstate = SYS_CFG;
     }
 
-    if (mycfg.wx_mode == 1)
+    if (mycfg.wx_mode > 0)
         init_sensors();
 }
 
@@ -1057,11 +1123,9 @@ void loop()
         {
             if (!loginAPRS())
             {
-                // 发送失败：若处于低电/夜间/阴雨则等30分钟重试，晴天正常时段等60秒重试
                 bool is_eco = (low_power_mode || night_mode || cloudy_mode);
                 sleepsec = is_eco ? 1800 : 60;
             }
-            // 发送成功时，sleepsec 已在 send_data() 内部根据昼夜/天气/电压动态更新为 3600 或 send_interval
 
             client_aprs.stop();
             last_send = millis();
